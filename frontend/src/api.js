@@ -1,5 +1,4 @@
-
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://drainwatch-hqt4.onrender.com";
 
 export async function calculateRisk(sites) {
   const response = await fetch(`${API_BASE}/api/risk`, {
@@ -26,7 +25,6 @@ export async function checkBackend() {
 
   return response.json();
 }
-
 
 export async function getWeather() {
   const response = await fetch(`${API_BASE}/api/weather`);
