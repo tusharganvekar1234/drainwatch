@@ -1,8 +1,8 @@
-
+import logging
 import os
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -10,10 +10,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
+logger = logging.getLogger("drainwatch")
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(
     title="DRAINWATCH API",
     description="Explainable pre-rain waterlogging decision support",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # Keep local development working. Add production frontend URLs through
@@ -54,6 +57,17 @@ DRAIN_IMPROVEMENTS = {
     "fair": "good",
     "good": None,
 }
+
+# ---- Weather provider settings ----
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_TIMEOUT = (5, 8)  # (connect seconds, read seconds)
+WEATHER_MAX_ATTEMPTS = 3
+WEATHER_RETRY_STATUS = {429, 500, 502, 503, 504}
+WEATHER_CACHE_SECONDS = 600  # reuse a real provider response for 10 minutes
+WEATHER_USER_AGENT = "DRAINWATCH/0.3 (hackathon project)"
+
+# Cache of real Open-Meteo responses: key -> (monotonic time, data, fetched_at)
+_weather_cache: dict = {}
 
 
 class Site(BaseModel):
@@ -241,39 +255,175 @@ def risk(request: RiskRequest):
     }
 
 
+# ---------------------------------------------------------------------------
+# Weather
+# ---------------------------------------------------------------------------
+
+def weather_error(
+    reason: str,
+    message: str,
+    upstream_status: int | None = None,
+) -> HTTPException:
+    """Build a 502 error that tells the frontend exactly what went wrong."""
+    return HTTPException(
+        status_code=502,
+        detail={
+            "reason": reason,
+            "message": message,
+            "upstream_status": upstream_status,
+        },
+    )
+
+
+def fetch_open_meteo(latitude: float, longitude: float):
+    """Return (raw_provider_data, was_cached, fetched_at_iso).
+
+    Only real Open-Meteo responses are ever returned or cached.
+    On failure this raises an HTTPException with a specific reason.
+    """
+    cache_key = (round(latitude, 2), round(longitude, 2))
+    cached = _weather_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < WEATHER_CACHE_SECONDS:
+        return cached[1], True, cached[2]
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": "precipitation",
+        "forecast_days": 2,
+        "timezone": "auto",
+    }
+    headers = {
+        "User-Agent": WEATHER_USER_AGENT,
+        "Accept": "application/json",
+    }
+
+    reason = "unknown"
+    message = "The weather service could not be reached."
+    upstream_status = None
+
+    for attempt in range(1, WEATHER_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                OPEN_METEO_URL,
+                params=params,
+                headers=headers,
+                timeout=WEATHER_TIMEOUT,
+            )
+        except requests.Timeout as exc:
+            reason = "timeout"
+            message = "The weather service took too long to respond."
+            upstream_status = None
+            logger.warning(
+                "Open-Meteo timeout (attempt %s/%s): %s",
+                attempt, WEATHER_MAX_ATTEMPTS, exc,
+            )
+        except requests.ConnectionError as exc:
+            reason = "connection_error"
+            message = "The server could not connect to the weather service."
+            upstream_status = None
+            logger.warning(
+                "Open-Meteo connection error (attempt %s/%s): %s",
+                attempt, WEATHER_MAX_ATTEMPTS, exc,
+            )
+        except requests.RequestException as exc:
+            reason = "request_error"
+            message = "The weather request failed."
+            upstream_status = None
+            logger.warning(
+                "Open-Meteo request error (attempt %s/%s): %s",
+                attempt, WEATHER_MAX_ATTEMPTS, exc,
+            )
+        else:
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    logger.error("Open-Meteo returned invalid JSON: %s", exc)
+                    raise weather_error(
+                        "invalid_response",
+                        "The weather service returned unreadable data. "
+                        "Please retry shortly.",
+                        200,
+                    ) from exc
+
+                if not isinstance(data, dict) or "hourly" not in data:
+                    logger.error("Open-Meteo response missing 'hourly'.")
+                    raise weather_error(
+                        "invalid_response",
+                        "The weather service returned an unexpected format. "
+                        "Please retry shortly.",
+                        200,
+                    )
+
+                fetched_at = datetime.now(timezone.utc).isoformat()
+                if len(_weather_cache) > 50:
+                    _weather_cache.clear()
+                _weather_cache[cache_key] = (
+                    time.monotonic(), data, fetched_at
+                )
+                return data, False, fetched_at
+
+            upstream_status = response.status_code
+            logger.warning(
+                "Open-Meteo HTTP %s (attempt %s/%s): %s",
+                response.status_code, attempt, WEATHER_MAX_ATTEMPTS,
+                response.text[:300],
+            )
+            if response.status_code == 429:
+                reason = "rate_limited"
+                message = (
+                    "The weather service is limiting requests right now."
+                )
+            elif response.status_code >= 500:
+                reason = "provider_error"
+                message = "The weather service is having problems."
+            else:
+                # 400-level errors other than 429 will not fix themselves.
+                reason = "provider_rejected_request"
+                message = "The weather service rejected the request."
+                break
+
+            if response.status_code not in WEATHER_RETRY_STATUS:
+                break
+
+        if attempt < WEATHER_MAX_ATTEMPTS:
+            time.sleep(attempt)  # wait 1s, then 2s
+
+    raise weather_error(
+        reason,
+        f"{message} Please retry shortly.",
+        upstream_status,
+    )
+
+
 @app.get("/api/weather")
 def get_weather(
     latitude: float = Query(12.9716, ge=-90, le=90),
     longitude: float = Query(77.5946, ge=-180, le=180),
 ):
     """Fetch the next six hours of forecast precipitation."""
-    try:
-        response = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": latitude,
-                "longitude": longitude,
-                "hourly": "precipitation",
-                "forecast_days": 2,
-                "timezone": "auto",
-            },
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
+    data, was_cached, fetched_at = fetch_open_meteo(latitude, longitude)
 
+    try:
         times = data["hourly"]["time"]
         precipitation = data["hourly"]["precipitation"]
-        timezone_name = data.get("timezone", "Asia/Kolkata")
+        if len(times) != len(precipitation):
+            raise ValueError("Hourly arrays have different lengths.")
 
-        now = datetime.now(ZoneInfo(timezone_name))
-        current_hour = now.strftime("%Y-%m-%dT%H:00")
+        timezone_name = data.get("timezone", "Asia/Kolkata")
+        offset_seconds = int(data["utc_offset_seconds"])
+
+        # Local time at the forecast location, without needing tzdata.
+        local_now = datetime.now(timezone.utc) + timedelta(
+            seconds=offset_seconds
+        )
+        current_hour = local_now.strftime("%Y-%m-%dT%H:00")
 
         start_index = next(
             (i for i, value in enumerate(times) if value >= current_hour),
             None,
         )
-
         if start_index is None:
             raise ValueError("No upcoming hourly forecast was returned.")
 
@@ -296,19 +446,17 @@ def get_weather(
                 for i in range(start_index, start_index + len(next_six))
             ],
             "units": "mm",
+            "fetched_at": fetched_at,
+            "served_from_cache": was_cached,
             "note": (
                 "Forecast precipitation is weather-model output, not a "
                 "measurement of water depth at a drain."
             ),
         }
 
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Weather provider request failed. Please retry.",
-        ) from exc
     except (KeyError, ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not process the weather forecast. Please retry.",
+        logger.exception("Could not process Open-Meteo data: %s", exc)
+        raise weather_error(
+            "invalid_response",
+            "Could not process the weather forecast. Please retry shortly.",
         ) from exc
