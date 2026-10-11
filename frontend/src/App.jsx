@@ -91,11 +91,13 @@ const NAV_ITEMS = [
 
 /* ---------- Helpers ---------- */
 
+
 function severityOf(score) {
-  if (score >= 75) return { key: "high", label: "High", bars: 3 };
-  if (score >= 50) return { key: "moderate", label: "Moderate", bars: 2 };
+  if (score >= 70) return { key: "high", label: "High", bars: 3 };
+  if (score >= 40) return { key: "moderate", label: "Moderate", bars: 2 };
   return { key: "watch", label: "Watch", bars: 1 };
 }
+
 
 function rainfallLabel(mm) {
   if (mm >= 40) return "Heavy";
@@ -108,11 +110,17 @@ function formatMm(mm) {
   return Number.isFinite(value) ? value.toFixed(1).replace(/\.0$/, "") : "—";
 }
 
-function firstActionFor(siteId) {
-  if (siteId === "D1") return "Inspect and clear Drain D4";
-  if (siteId === "D2") return "Inspect roadside drainage";
+
+function firstActionFor(site) {
+  if (site?.recommendedAction?.title) {
+    return site.recommendedAction.title;
+  }
+
+  if (site?.id === "D1") return "Inspect and clear drainage";
+  if (site?.id === "D2") return "Inspect roadside drainage";
   return "Check drain inlets before rain";
 }
+
 
 /* ---------- Small presentational components ---------- */
 
@@ -295,6 +303,11 @@ function App() {
           ? apiSite.top_risk_drivers.map((driver) => driver.factor)
           : [],
         fromApi: Boolean(apiSite),
+        
+recommendedAction: apiSite?.recommended_action ?? null,
+interventionAssessment: apiSite?.intervention_assessment ?? null,
+inputSummary: apiSite?.input_summary ?? null,
+
       };
     }).sort((a, b) => b.risk - a.risk);
   }, [apiSites, analysisRainfall]);
@@ -306,15 +319,22 @@ function App() {
     selectedActions.includes(action.id)
   );
   const totalTime = chosenActions.reduce((sum, action) => sum + action.time, 0);
-  const estimatedReduction = chosenActions.reduce(
-    (sum, action) => sum + action.reduction,
-    0
-  );
-  const simulatedRisk = Math.max(
-    0,
-    selected.risk - Math.min(estimatedReduction, selected.risk)
-  );
-  const appliedReduction = selected.risk - simulatedRisk;
+  
+const interventionAssessment = selected.interventionAssessment;
+
+const appliedReduction =
+  interventionAssessment?.available
+    ? Math.max(
+        0,
+        Number(interventionAssessment.modelled_score_change) || 0
+      )
+    : null;
+
+const simulatedRisk =
+  appliedReduction === null
+    ? selected.risk
+    : Math.max(0, selected.risk - appliedReduction);
+
   const exceedsTime = totalTime > minutes;
   const timeFill = Math.min(100, Math.round((totalTime / minutes) * 100));
 
@@ -551,7 +571,7 @@ function App() {
 
             <div className="next-action">
               <div className="next-action-label">Recommended next action</div>
-              <h3>{firstActionFor(topLocation.id)}</h3>
+              <h3>{firstActionFor(topLocation)}</h3>
               <p>
                 {topLocation.name} ranks highest ({topLocation.risk}/100,{" "}
                 {topLocation.severity.label.toLowerCase()} severity).{" "}
@@ -909,7 +929,7 @@ function App() {
                 </div>
                 <div>
                   <span>Suggested first action</span>
-                  <strong>{firstActionFor(selected.id)}</strong>
+                  <strong>{firstActionFor(selected)}</strong>
                   <small>Confirm conditions on site before acting.</small>
                 </div>
               </div>
@@ -967,10 +987,12 @@ function App() {
                           <Clock size={13} aria-hidden="true" /> {action.time} min
                         </small>
                       </span>
-                      <span className="action-impact">
-                        −{action.reduction}
-                        <small>illustrative</small>
-                      </span>
+                      
+<span className="action-impact">
+  {action.time} min
+  <small>planning estimate</small>
+</span>
+
                     </label>
                   );
                 })}
@@ -1072,14 +1094,23 @@ function App() {
                   </div>
                   <div>
                     <dt>Score change</dt>
-                    <dd>−{appliedReduction} pts</dd>
+                    
+<dd>
+  {appliedReduction === null
+    ? "Not modelled"
+    : `−${appliedReduction} pts`}
+</dd>
+
                   </div>
                 </dl>
 
-                <p className="result-note">
-                  Reductions are illustrative assumptions, not measured real-world
-                  results.
-                </p>
+                
+<p className="result-note">
+  {interventionAssessment?.available
+    ? interventionAssessment.note
+    : "No modelled intervention change is available for this site's current inputs. Verify site conditions before acting."}
+</p>
+
 
                 <button
                   type="button"
@@ -1185,7 +1216,7 @@ function App() {
                             </span>
                             <span className="step-meta">
                               <span>{item.time} min</span>
-                              <small>−{item.reduction} pts (illustrative)</small>
+                              <small>Planning estimate only · verify on site</small>
                             </span>
                           </label>
                         </li>

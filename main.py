@@ -1,25 +1,59 @@
-import requests
-from fastapi import HTTPException, Query
+
+import os
 from datetime import datetime, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+import requests
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
 
 app = FastAPI(
     title="DRAINWATCH API",
     description="Explainable pre-rain waterlogging decision support",
-    version="0.1.0",
+    version="0.2.0",
 )
+
+# Keep local development working. Add production frontend URLs through
+# DRAINWATCH_CORS_ORIGINS when deploying.
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "DRAINWATCH_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Keep these thresholds consistent with the frontend.
+HIGH_RISK_THRESHOLD = 70
+MODERATE_RISK_THRESHOLD = 40
+LOW_RAINFALL_THRESHOLD_MM = 2.5
+
+DRAIN_PENALTY = {
+    "good": 0.0,
+    "fair": 12.0,
+    "poor": 25.0,
+}
+
+# These are hypothetical condition improvements for decision support,
+# not measured or guaranteed real-world intervention effects.
+DRAIN_IMPROVEMENTS = {
+    "poor": "fair",
+    "fair": "good",
+    "good": None,
+}
 
 
 class Site(BaseModel):
@@ -36,37 +70,51 @@ class RiskRequest(BaseModel):
     sites: list[Site]
 
 
-DRAIN_PENALTY = {"good": 0.0, "fair": 12.0, "poor": 25.0}
+def risk_level(score: int) -> str:
+    if score >= HIGH_RISK_THRESHOLD:
+        return "HIGH"
+    if score >= MODERATE_RISK_THRESHOLD:
+        return "MODERATE"
+    return "LOW"
+
+
+def raw_risk_components(site: Site) -> dict:
+    return {
+        "rainfall": min(site.rainfall_mm / 60.0, 1.0) * 35,
+        "terrain": site.elevation_vulnerability * 20,
+        "surface": site.impervious_fraction * 15,
+        "drainage": DRAIN_PENALTY[site.drain_condition],
+        "history": min(site.historical_incidents / 10.0, 1.0) * 10,
+    }
 
 
 def calculate_risk(site: Site) -> dict:
-    # Transparent screening score, not a calibrated flood probability.
-    rainfall = min(site.rainfall_mm / 60.0, 1.0) * 35
-    terrain = site.elevation_vulnerability * 20
-    surface = site.impervious_fraction * 15
-    drainage = DRAIN_PENALTY[site.drain_condition]
-    history = min(site.historical_incidents / 10.0, 1.0) * 10
+    """Calculate a transparent screening score, not flood probability."""
+    components = raw_risk_components(site)
+    score = round(max(0, min(100, sum(components.values()))))
 
-    score = round(min(100, rainfall + terrain + surface + drainage + history))
+    labels = {
+        "rainfall": "Heavy rainfall",
+        "terrain": "Terrain vulnerability",
+        "surface": "Impervious surface",
+        "drainage": "Drainage condition",
+        "history": "Historical incidents",
+    }
 
-    factors = [
-        ("Heavy rainfall", rainfall),
-        ("Terrain vulnerability", terrain),
-        ("Impervious surface", surface),
-        ("Drainage condition", drainage),
-        ("Historical incidents", history),
-    ]
-    factors.sort(key=lambda item: item[1], reverse=True)
+    factors = sorted(
+        (
+            (labels[key], value)
+            for key, value in components.items()
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
 
-    return {
+    result = {
         "id": site.id,
         "name": site.name,
         "risk_score": score,
-        "risk_level": (
-            "HIGH" if score >= 70 else
-            "MODERATE" if score >= 40 else
-            "LOW"
-        ),
+        "risk_level": risk_level(score),
         "top_risk_drivers": [
             {"factor": name, "contribution": round(value, 1)}
             for name, value in factors[:3]
@@ -82,6 +130,85 @@ def calculate_risk(site: Site) -> dict:
         "model_type": "transparent_screening_score",
         "is_calibrated_probability": False,
     }
+
+    # Recommendations depend on the rainfall value supplied for this site.
+    if site.rainfall_mm < LOW_RAINFALL_THRESHOLD_MM:
+        result["recommended_action"] = {
+            "type": "routine_check",
+            "title": "Routine drainage checks",
+            "reason": (
+                "The supplied next-six-hour rainfall forecast is below "
+                f"{LOW_RAINFALL_THRESHOLD_MM} mm. Continue routine checks "
+                "and reassess when the forecast changes."
+            ),
+        }
+    elif site.drain_condition == "poor":
+        result["recommended_action"] = {
+            "type": "inspect_and_clear",
+            "title": "Inspect and clear the drainage system",
+            "reason": (
+                "Rainfall is forecast and the supplied drain condition "
+                "is poor. Verify the site condition before assigning work."
+            ),
+        }
+    elif site.drain_condition == "fair":
+        result["recommended_action"] = {
+            "type": "inspect_drain",
+            "title": "Inspect the drainage system",
+            "reason": (
+                "Rainfall is forecast and the supplied drain condition "
+                "is fair. Check for obstruction and confirm readiness."
+            ),
+        }
+    else:
+        result["recommended_action"] = {
+            "type": "verify_and_monitor",
+            "title": "Verify drainage readiness and monitor",
+            "reason": (
+                "Rainfall is forecast, but the supplied drain condition "
+                "is good. Verify the inspection record and monitor updates."
+            ),
+        }
+
+    # Estimate score change by rerunning the same model with a hypothetical
+    # one-step drainage-condition improvement.
+    improved_condition = DRAIN_IMPROVEMENTS[site.drain_condition]
+
+    if improved_condition is None:
+        result["intervention_assessment"] = {
+            "available": False,
+            "message": (
+                "Drain condition is already marked good. No further "
+                "drain-condition improvement is modelled."
+            ),
+        }
+    else:
+        improved_site = site.model_copy(
+            update={"drain_condition": improved_condition}
+        )
+        improved_score = calculate_score_only(improved_site)
+
+        result["intervention_assessment"] = {
+            "available": True,
+            "action": "Verify and improve drainage condition",
+            "current_condition": site.drain_condition,
+            "assumed_condition_after": improved_condition,
+            "current_screening_score": score,
+            "assumed_screening_score_after": improved_score,
+            "modelled_score_change": score - improved_score,
+            "is_guaranteed_real_world_reduction": False,
+            "note": (
+                "Hypothetical screening-score change from changing the "
+                "drain-condition input only. Actual impact must be verified."
+            ),
+        }
+
+    return result
+
+
+def calculate_score_only(site: Site) -> int:
+    components = raw_risk_components(site)
+    return round(max(0, min(100, sum(components.values()))))
 
 
 @app.get("/")
@@ -119,7 +246,7 @@ def get_weather(
     latitude: float = Query(12.9716, ge=-90, le=90),
     longitude: float = Query(77.5946, ge=-180, le=180),
 ):
-    """Fetch an hourly precipitation forecast for a location."""
+    """Fetch the next six hours of forecast precipitation."""
     try:
         response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -128,7 +255,7 @@ def get_weather(
                 "longitude": longitude,
                 "hourly": "precipitation",
                 "forecast_days": 2,
-                "timezone": "Asia/Kolkata",
+                "timezone": "auto",
             },
             timeout=15,
         )
@@ -137,12 +264,9 @@ def get_weather(
 
         times = data["hourly"]["time"]
         precipitation = data["hourly"]["precipitation"]
+        timezone_name = data.get("timezone", "Asia/Kolkata")
 
-        # Sum the next six forecast hours from the current local hour.
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
-        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        now = datetime.now(ZoneInfo(timezone_name))
         current_hour = now.strftime("%Y-%m-%dT%H:00")
 
         start_index = next(
@@ -160,28 +284,31 @@ def get_weather(
             "provider": "Open-Meteo",
             "latitude": latitude,
             "longitude": longitude,
-            "timezone": data.get("timezone", "Asia/Kolkata"),
+            "timezone": timezone_name,
             "forecast_start": times[start_index],
             "hours_included": len(next_six),
             "next_6_hours_precipitation_mm": rainfall_mm,
             "hourly_forecast": [
-                {"time": times[i], "precipitation_mm": precipitation[i]}
+                {
+                    "time": times[i],
+                    "precipitation_mm": precipitation[i],
+                }
                 for i in range(start_index, start_index + len(next_six))
             ],
             "units": "mm",
             "note": (
-                "Forecast precipitation is weather-model output, "
-                "not a measurement of water depth at a drain."
+                "Forecast precipitation is weather-model output, not a "
+                "measurement of water depth at a drain."
             ),
         }
 
     except requests.RequestException as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Weather provider request failed: {exc}",
+            detail="Weather provider request failed. Please retry.",
         ) from exc
     except (KeyError, ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Could not process the weather forecast: {exc}",
+            detail="Could not process the weather forecast. Please retry.",
         ) from exc
